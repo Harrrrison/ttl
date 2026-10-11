@@ -1,0 +1,8 @@
+/target
+
+# Never commit the task store; it is personal and machine-local.
+*.json
+!Cargo.toml
+tasks.json
+events.jsonl
+store.lock
