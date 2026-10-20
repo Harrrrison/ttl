@@ -80,6 +80,9 @@ pub enum Command {
     /// Create a task.
     Add(AddArgs),
 
+    /// Create one or more tasks from a JSON document, atomically.
+    Import(ImportArgs),
+
     /// Change fields on an existing task.
     #[command(visible_alias = "set")]
     Edit(EditArgs),
@@ -229,6 +232,26 @@ pub struct TimelineArgs {
     /// Only top-level tasks.
     #[arg(long)]
     pub roots: bool,
+}
+
+/// Arguments for `ttm import`.
+#[derive(Debug, Args, Clone)]
+pub struct ImportArgs {
+    /// JSON document: a path, `-` for stdin, or the JSON itself.
+    #[arg(value_name = "SOURCE")]
+    pub source: Option<String>,
+
+    /// Validate and print what would be created, without writing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip tasks whose title already exists in the store.
+    #[arg(long)]
+    pub skip_existing: bool,
+
+    /// Fail if any task in the document already exists.
+    #[arg(long, conflicts_with = "skip_existing")]
+    pub no_duplicates: bool,
 }
 
 #[derive(Debug, Args)]
@@ -576,6 +599,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Summary(a)) => cmd_summary(&store, flags, a),
         Some(Command::Timeline(a)) => cmd_timeline(&store, flags, a),
         Some(Command::Add(a)) => cmd_add(&store, flags, a),
+        Some(Command::Import(a)) => cmd_import(&store, flags, a),
         Some(Command::Edit(a)) => cmd_edit(&store, flags, a),
         Some(Command::Done(a)) => cmd_set_status(&store, flags, a, Status::Done),
         Some(Command::Start(a)) => cmd_set_status(&store, flags, a, Status::Doing),
@@ -1301,6 +1325,129 @@ fn build_attachments(
         out.push(a);
     }
     Ok(out)
+}
+
+/// Read an import source: a file path, `-` for stdin, or inline JSON.
+fn read_import_source(source: &str) -> Result<String> {
+    if source == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin().lock(), &mut buf)
+            .map_err(|e| Failure::usage(format!("could not read stdin: {e}")))?;
+        return Ok(buf);
+    }
+    // A source that parses as JSON is taken literally; anything else is a path.
+    // That keeps `ttm import '{"title":"x"}'` working without a `--json` flag.
+    if source.trim_start().starts_with('{') || source.trim_start().starts_with('[') {
+        return Ok(source.to_string());
+    }
+    std::fs::read_to_string(source)
+        .map_err(|e| Failure::usage(format!("could not read {source:?}: {e}")))
+}
+
+/// Create tasks from a JSON document.
+///
+/// The whole document is parsed, validated and planned *before* the store lock
+/// is taken, and then inserted in a single `mutate`. Either every task in the
+/// document lands or none does, which is the property an automation flow needs:
+/// a half-applied batch is far worse than a rejected one.
+fn cmd_import(store: &Store, flags: GlobalFlags, args: ImportArgs) -> Result<()> {
+    let now = Utc::now();
+    let output = Output::resolve(flags, Some(Output::Json));
+
+    let source = args.source.as_deref().unwrap_or("-");
+    let text = read_import_source(source)?;
+    let doc = crate::import::parse(&text).map_err(Failure::usage)?;
+
+    let existing = store.snapshot()?;
+    let known: Vec<String> = crate::import::existing_titles(&existing);
+
+    let planned = crate::import::plan(doc, now, |r| {
+        existing
+            .resolve(r)
+            .ok()
+            .and_then(|id| existing.get(&id).map(|t| t.id))
+    })
+    .map_err(|e| Failure::usage(format!("invalid import: {e}")))?;
+
+    // The store is needed for this check so a parent that already exists is not
+    // mistaken for a missing one.
+    crate::import::check_graph(&planned, &existing)
+        .map_err(|e| Failure::store(format!("invalid import: {e}")))?;
+
+    // De-duplicate by title. Done before the dry-run report so the report shows
+    // exactly what would be written.
+    let mut seen = known.clone();
+    let mut selected = Vec::new();
+    let mut skipped = Vec::new();
+    for p in planned {
+        if args.skip_existing && seen.contains(&p.task.title) {
+            skipped.push(p.task.title.clone());
+            continue;
+        }
+        if args.no_duplicates && seen.contains(&p.task.title) {
+            return Err(Failure::store(format!(
+                "task {:?} already exists; pass --skip-existing to ignore it",
+                p.task.title
+            )));
+        }
+        seen.push(p.task.title.clone());
+        selected.push(p);
+    }
+
+    if args.dry_run {
+        return print_json(&json!({
+            "dry_run": true,
+            "would_create": selected.iter().map(|p| &p.task).collect::<Vec<_>>(),
+            "skipped": skipped,
+        }));
+    }
+
+    let created: Vec<Task> = store.mutate(|set, events| {
+        if args.no_duplicates
+            && let Some(dup) = selected
+                .iter()
+                .find(|p| set.tasks.iter().any(|t| t.title == p.task.title))
+        {
+            return Err(StoreError::Validation(ValidationError::DuplicateTitle(
+                dup.task.title.clone(),
+            )));
+        }
+
+        let mut made = Vec::with_capacity(selected.len());
+        for p in &selected {
+            // Checked per task, against what has already been inserted in this
+            // same loop, so a nested child finds the parent from this batch.
+            if let Some(pid) = p.parent
+                && set.get(&pid).is_none()
+            {
+                return Err(StoreError::Validation(ValidationError::ParentNotFound(pid)));
+            }
+            let mut t = p.task.clone();
+            t.parent_id = p.parent;
+            t.updated_at = now;
+            set.insert(t.clone())?;
+            events.push(Event::new(EventKind::TaskCreated, Some(t.id)).with_title(t.title.clone()));
+            made.push(t);
+        }
+        Ok(made)
+    })?;
+
+    match output {
+        Output::Json => print_json(&json!({
+            "created": created,
+            "count": created.len(),
+            "skipped": skipped,
+        })),
+        _ => {
+            for t in &created {
+                println!("{}  {}", t.id, t.title);
+            }
+            for s in &skipped {
+                println!("(skipped existing)  {s}");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn cmd_add(store: &Store, flags: GlobalFlags, args: AddArgs) -> Result<()> {

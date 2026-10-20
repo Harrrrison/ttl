@@ -46,30 +46,36 @@ pub fn cell_style(cell: Cell, row: &timeline::Row, selected: bool) -> Style {
 /// meaningless sequence.
 #[must_use]
 pub fn header_lines(tl: &Timeline, offset: usize) -> Vec<Line<'static>> {
-    // Month names are wider than a column, so each is written starting at its
-    // own column and the row is padded back out to the full chart width.
+    let cw = tl.scale.column_width();
     let style = Style::default()
         .fg(theme::TITLE)
         .add_modifier(Modifier::BOLD);
-    let mut month_cells = vec![String::new(); tl.columns];
-    for col in 0..tl.columns {
-        let Some(label) = tl.months.get(col).and_then(|m| m.as_ref()) else {
+
+    // Month names are wider than one column, so each is written at its own
+    // starting character offset. A later month that would overlap an earlier
+    // one is skipped rather than drawn on top of it.
+    let chart_width = tl.columns * cw;
+    let mut month_row = vec![' '; chart_width];
+    for (col, label) in tl.months.iter().enumerate().take(tl.columns) {
+        let Some(label) = label else { continue };
+        let start = col * cw;
+        let end = start + label.chars().count();
+        if end > chart_width || month_row[start..end].iter().any(|c| *c != ' ') {
             continue;
-        };
+        }
         for (i, c) in label.chars().enumerate() {
-            if col + i < tl.columns {
-                month_cells[col + i] = c.to_string();
-            }
+            month_row[start + i] = c;
         }
     }
-    let months: Vec<Span> = std::iter::once(Span::raw(" ".repeat(offset)))
-        .chain(month_cells.into_iter().map(|c| Span::styled(c, style)))
-        .collect();
+    let months: Vec<Span> = vec![
+        Span::raw(" ".repeat(offset)),
+        Span::styled(month_row.into_iter().collect::<String>(), style),
+    ];
 
     let mut days: Vec<Span> = vec![Span::raw(" ".repeat(offset))];
     for (col, label) in tl.header.iter().enumerate().take(tl.columns) {
         let is_now = col == tl.now_col;
-        let style = if is_now {
+        let cell_style = if is_now {
             Style::default()
                 .fg(theme::TITLE)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -80,12 +86,17 @@ pub fn header_lines(tl: &Timeline, offset: usize) -> Vec<Line<'static>> {
                 .fg(theme::HEADER)
                 .add_modifier(Modifier::DIM)
         };
-        // Every column emits exactly one character, which is what keeps the axis
-        // aligned with the chart drawn beneath it.
-        days.push(Span::styled(
-            if label.is_empty() { " " } else { label }.to_string(),
-            style,
-        ));
+        // Each label is padded to exactly the column width, which is what keeps
+        // the axis aligned with the chart drawn beneath it.
+        let mut cell = String::new();
+        for _ in label.chars().count()..cw {
+            cell.push(' ');
+        }
+        cell.push_str(label);
+        while cell.chars().count() < cw {
+            cell.push(' ');
+        }
+        days.push(Span::styled(cell, cell_style));
     }
 
     if tl.months.iter().all(Option::is_none) {
@@ -153,12 +164,12 @@ pub fn row_line(
 
     // Chart cells.
     let cells = timeline::row_cells(row, tl);
-    for (col, cell) in cells.iter().enumerate().take(tl.columns) {
+    let width = tl.scale.column_width();
+    for cell in cells.iter().take(tl.columns) {
         spans.push(Span::styled(
-            cell.glyph().to_string(),
+            cell.render(width),
             cell_style(*cell, row, selected),
         ));
-        let _ = col;
     }
 
     // Right gutter: countdown, then estimate.
@@ -228,9 +239,14 @@ pub fn render(frame: &mut Frame, area: Rect, tl: &Timeline, cursor: usize, scrol
         .saturating_sub(usize::from(GUTTER))
         .min(usize::from(TITLE_MAX))
         .max(1);
+    // A column is not one character: days are three wide, so the character
+    // budget has to be divided by the column width to get a column count.
+    // Without this the chart is over-wide by a factor of three and every row
+    // wraps onto a second line.
     let chart_columns = inner_width
         .saturating_sub(title_width)
-        .saturating_sub(usize::from(GUTTER));
+        .saturating_sub(usize::from(GUTTER))
+        / tl.scale.column_width();
 
     // The chart may have been laid out for a different terminal; re-narrow it so
     // the geometry and the drawing agree.

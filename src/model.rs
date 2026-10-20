@@ -539,6 +539,8 @@ pub enum ValidationError {
     NestingTooDeep { child: TaskId, parent: TaskId },
     #[error("duplicate task id in store: {0}")]
     DuplicateId(TaskId),
+    #[error("a task titled {0:?} already exists")]
+    DuplicateTitle(String),
 }
 
 // ---------------------------------------------------------------------------

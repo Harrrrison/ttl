@@ -16,6 +16,7 @@ pub mod cli;
 pub mod detail;
 pub mod editor;
 pub mod form;
+pub mod import;
 pub mod input;
 pub mod model;
 pub mod store;

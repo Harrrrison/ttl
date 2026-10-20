@@ -588,7 +588,7 @@ impl App {
 
     /// Lay the chart out for the current rows, selection, scale, and width.
     #[must_use]
-    pub fn timeline(&self, chart_columns: usize) -> crate::timeline::Timeline {
+    pub fn timeline(&self, columns: usize) -> crate::timeline::Timeline {
         let inputs: Vec<crate::timeline::Input<'_>> = self
             .rows
             .iter()
@@ -599,7 +599,7 @@ impl App {
                 children_done: r.children_done,
             })
             .collect();
-        crate::timeline::Timeline::build(&inputs, Utc::now(), self.scale, chart_columns)
+        crate::timeline::Timeline::build(&inputs, Utc::now(), self.scale, columns)
     }
 
     /// The task the detail pane is showing.
@@ -2446,11 +2446,13 @@ mod tests {
     fn a_tiny_timeline_does_not_panic() {
         let (mut app, _tmp) = app_with(vec![t("a"), t("b")]);
         app.act(Action::ToggleTimeline);
-        for columns in [0usize, 1, 5, 200] {
-            let tl = app.timeline(columns);
-            assert!(tl.columns >= 1);
-            assert_eq!(tl.rows.len(), 2);
-        }
+        let tl = app.timeline(40);
+        assert!(tl.columns >= 1);
+        assert_eq!(tl.rows.len(), 2);
+        // Clamping to an absurdly narrow chart must also survive.
+        let tiny = tl.narrow(1);
+        assert_eq!(tiny.columns, 1);
+        assert_eq!(tiny.rows.len(), 2);
     }
 
     #[test]

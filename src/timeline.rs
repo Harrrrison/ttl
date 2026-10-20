@@ -51,35 +51,78 @@ impl Scale {
     }
 
     /// Days of calendar each column covers.
+    ///
+    /// Month scale has no fixed answer here — months run 28 to 31 days — so
+    /// this returns an average used only for window sizing and the estimate
+    /// marker. Exact month boundaries come from [`step`], which does real
+    /// calendar arithmetic.
     #[must_use]
     pub fn bucket_days(self) -> i64 {
         match self {
             Scale::Day => 1,
             Scale::Week => 7,
-            // Months vary in length; this is only used for the window size and
-            // the estimate marker, where an average is fine. Exact column
-            // boundaries come from [`Timeline::column_of`].
             Scale::Month => 30,
         }
     }
 
-    /// How much history to show to the left of today.
+    /// How many terminal characters wide one column is drawn.
+    ///
+    /// Three characters per day column is what makes a readable axis: the day
+    /// number is padded to two and followed by a space, so the sequence reads
+    /// ` 9  10  11` rather than running together as `91011`. One character per
+    /// column could not hold `10` at all, which is why the old axis stopped at
+    /// nine; two held the numbers but ran them together.
     #[must_use]
-    pub fn context_days(self) -> i64 {
+    pub fn column_width(self) -> usize {
         match self {
-            Scale::Day => 10,
-            Scale::Week => 28,
-            Scale::Month => 60,
+            Scale::Day | Scale::Week => 3,
+            Scale::Month => 3,
         }
     }
 
-    /// How much runway to show to the right of today.
+    /// How many buckets of history to show to the left of today.
     #[must_use]
-    pub fn runway_days(self) -> i64 {
+    pub fn context_buckets(self) -> i64 {
         match self {
-            Scale::Day => 28,
-            Scale::Week => 84,
-            Scale::Month => 120,
+            Scale::Day => 7,
+            Scale::Week => 2,
+            Scale::Month => 1,
+        }
+    }
+
+    /// How many buckets of runway to show to the right of today.
+    ///
+    /// Each scale shows roughly the same planning horizon in its own units: the
+    /// day scale is a month of individual days, the week scale about two months,
+    /// and the month scale two months. Zooming in therefore trades horizon for
+    /// legibility rather than silently dropping off a cliff — a day column is
+    /// one character wide, so cramming sixty of them onto a row makes every
+    /// individual day unreadable.
+    #[must_use]
+    pub fn runway_buckets(self) -> i64 {
+        match self {
+            Scale::Day => 30,
+            Scale::Week => 9,
+            Scale::Month => 2,
+        }
+    }
+
+    /// Advance a date by `n` buckets.
+    ///
+    /// Months are stepped in the calendar, not by a fixed number of days. This
+    /// is the single reason the axis lines up: a 30-day month bucket drifts a
+    /// day every few months and eventually puts a column labelled `Oct` inside
+    /// November.
+    #[must_use]
+    pub fn step(self, from: NaiveDate, n: i64) -> NaiveDate {
+        match self {
+            Scale::Day | Scale::Week => from + Duration::days(n * self.bucket_days()),
+            Scale::Month => {
+                let total = i64::from(from.year()) * 12 + i64::from(from.month()) - 1 + n;
+                let year = i32::try_from(total.div_euclid(12)).unwrap_or(from.year());
+                let month = u32::try_from(total.rem_euclid(12) + 1).unwrap_or(1);
+                NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(from)
+            }
         }
     }
 
@@ -181,6 +224,10 @@ pub struct Timeline {
     /// Month abbreviation at the column where each month starts, `None`
     /// elsewhere. Sized to `columns` so the axis can be drawn at any width.
     pub months: Vec<Option<String>>,
+    /// First calendar day covered by each column. Parallel to `header` and
+    /// `weekend`, so the axis can be labelled from real dates rather than
+    /// re-derived by adding bucket lengths and hoping.
+    pub dates: Vec<NaiveDate>,
     pub rows: Vec<Row>,
 }
 
@@ -193,47 +240,75 @@ impl Timeline {
     /// Column a date falls in, or `None` when it is off the chart.
     ///
     /// The offset is measured in buckets, not raw days: at week scale every
-    /// seven days share a column, which is the whole point of the scale.
+    /// seven days share a column, and at month scale every calendar month is
+    /// one column. Dividing by a nominal 30 days would put the 15th of a month
+    /// a fortnight out, so months are counted with real calendar arithmetic.
     #[must_use]
     pub fn column_of(&self, date: NaiveDate) -> Option<usize> {
-        let offset = (date - self.from).num_days();
-        if offset < 0 {
-            return None;
-        }
-        let bucket = self.scale.bucket_days().max(1);
-        let col = usize::try_from(offset / bucket).ok()?;
+        let col = match self.scale {
+            Scale::Day | Scale::Week => {
+                let bucket = self.scale.bucket_days().max(1);
+                let offset = (date - self.from).num_days();
+                if offset < 0 {
+                    return None;
+                }
+                offset / bucket
+            }
+            Scale::Month => {
+                let months = i64::from(date.year()) * 12 + i64::from(date.month())
+                    - i64::from(self.from.year()) * 12
+                    - i64::from(self.from.month());
+                if months < 0 {
+                    return None;
+                }
+                months
+            }
+        };
+        let col = usize::try_from(col).ok()?;
         (col < self.columns).then_some(col)
     }
 
     /// Build the chart.
     ///
-    /// `chart_columns` is how many columns are actually available to draw in;
-    /// `columns` may be larger, in which case the window is scrolled so `now_col`
-    /// stays visible.
+    /// The window is anchored to the bucket containing today and sized to cover
+    /// two months from today, plus a little history so recently finished work
+    /// stays on screen. Every column date comes from [`Scale::step`], so month
+    /// columns are real calendar months and the day numbers inside them line up
+    /// with the header.
+    ///
+    /// `columns` is how many columns the caller can draw, in columns rather
+    /// than characters; the window grows to fill it, and a caller that needs
+    /// fewer can pass a result through [`Self::narrow`].
     pub fn build(inputs: &[Input<'_>], now: DateTime<Utc>, scale: Scale, columns: usize) -> Self {
         let today = Self::local(now);
-        let bucket = scale.bucket_days();
+        let context = scale.context_buckets();
 
-        // Anchor the window to whole buckets so headers read cleanly, then
-        // size it from the real horizon: context behind today, plus today, plus
-        // the runway. Deriving the count from `bucket_days` alone would put
-        // today off-chart at month scale, where a bucket is longer than the
-        // context window.
-        let bucket_start = scale.bucket_start(today);
-        let from = bucket_start - Duration::days(scale.context_days());
-        let horizon_days =
-            scale.context_days() + (today - bucket_start).num_days() + scale.runway_days();
-        let needed = usize::try_from((horizon_days + bucket - 1) / bucket + 1).unwrap_or(1);
-        let columns = columns.max(1);
-        // Extra width extends the runway rather than changing the resolution.
-        let span = needed.max(columns);
+        // Anchor to a whole bucket so headers read cleanly, then step back in
+        // real calendar units.
+        let anchor = scale.bucket_start(today);
+        let from = scale.step(anchor, -context);
+        // `runway_buckets` is measured from the *anchor*, and today can sit
+        // partway through its own bucket, so add the remainder of it.
+        let into_bucket = (today - anchor)
+            .num_days()
+            .div_euclid(scale.bucket_days().max(1));
+        let needed = context + into_bucket.max(0) + scale.runway_buckets() + 1;
+        let needed = usize::try_from(needed.max(1)).unwrap_or(1);
+        // `columns` is how many columns the caller can actually draw, so the
+        // window stretches to fill the panel rather than leaving a void. Note
+        // this is columns, not characters: a day column is two characters wide,
+        // so the caller divides the available width by [`Scale::column_width`]
+        // before passing it here.
+        let span = needed.max(columns.max(1));
 
         let mut weekend = Vec::with_capacity(span);
         let mut header = Vec::with_capacity(span);
+        let mut dates = Vec::with_capacity(span);
         let mut months: Vec<Option<String>> = vec![None; span];
         let mut previous: Option<(i32, u32)> = None;
         for (i, month) in months.iter_mut().enumerate() {
-            let date = from + Duration::days(i64::try_from(i).unwrap_or(0) * bucket);
+            let date = scale.step(from, i64::try_from(i).unwrap_or(0));
+            dates.push(date);
             weekend.push(matches!(
                 date.weekday(),
                 chrono::Weekday::Sat | chrono::Weekday::Sun
@@ -242,23 +317,15 @@ impl Timeline {
             // At month scale each column already *is* a month, so it is labelled
             // directly; the separate month row is suppressed there, because
             // writing a three-letter name across three columns garbles the axis.
+            // Every column carries its own label. Truncating to single digits
+            // because a column was one character wide meant the axis could
+            // never show the tenth of a month onwards; the column is two wide
+            // now, so the whole 1..31 fits.
             header.push(match scale {
-                // Only single-digit days are labelled; the month row above
-                // carries the rest of the information.
-                Scale::Day | Scale::Week => {
-                    if (1..=9).contains(&date.day()) {
-                        date.day().to_string()
-                    } else {
-                        String::new()
-                    }
-                }
-                Scale::Month => date
-                    .format("%b")
-                    .to_string()
-                    .chars()
-                    .next()
-                    .unwrap_or(' ')
-                    .to_string(),
+                // Padded to the two characters a day number needs; the extra
+                // column is the separator the renderer adds.
+                Scale::Day | Scale::Week => format!("{:2}", date.day()),
+                Scale::Month => date.format("%b").to_string(),
             });
 
             if scale != Scale::Month {
@@ -276,11 +343,12 @@ impl Timeline {
         let mut tl = Self {
             scale,
             from,
-            to: from + Duration::days(i64::try_from(span).unwrap_or(0) * bucket),
+            to: scale.step(from, i64::try_from(span).unwrap_or(0)),
             columns: span,
             now_col: 0,
             header,
             months,
+            dates,
             weekend,
             rows: Vec::with_capacity(inputs.len()),
         };
@@ -304,11 +372,11 @@ impl Timeline {
             return self.clone();
         }
         let mut out = self.clone();
-        let step = self.scale.bucket_days().max(1);
         let keep = columns;
         out.header.truncate(keep);
         out.weekend.truncate(keep);
         out.months.truncate(keep);
+        out.dates.truncate(keep);
         out.columns = keep;
         out.rows = out
             .rows
@@ -324,7 +392,7 @@ impl Timeline {
                 r
             })
             .collect();
-        out.to = out.from + Duration::days(i64::try_from(keep).unwrap_or(0) * step);
+        out.to = self.scale.step(self.from, i64::try_from(keep).unwrap_or(0));
         out
     }
 
@@ -475,6 +543,29 @@ pub enum Cell {
 }
 
 impl Cell {
+    /// Render this cell into a column of `width` characters.
+    ///
+    /// Fill glyphs repeat so a bar reads as one continuous run; marker glyphs
+    /// sit at the leading edge of the column and leave the rest blank, so a
+    /// due-date marker is a single `▐` rather than a doubled one.
+    #[must_use]
+    pub fn render(self, width: usize) -> String {
+        let glyph = self.glyph();
+        if width == 0 {
+            return String::new();
+        }
+        let repeat = matches!(self, Cell::Bar | Cell::Done | Cell::Overdue | Cell::Weekend);
+        if repeat && glyph.chars().count() < width {
+            glyph.repeat(width)
+        } else {
+            let mut s = String::from(glyph);
+            for _ in glyph.chars().count()..width {
+                s.push(' ');
+            }
+            s
+        }
+    }
+
     /// The glyph to draw.
     #[must_use]
     pub fn glyph(self) -> &'static str {
@@ -678,24 +769,26 @@ mod tests {
     }
 
     #[test]
-    fn zooming_out_covers_more_calendar_in_the_same_width() {
-        let width = 40;
-        let day_tl = Timeline::build(&[], now(), Scale::Day, width);
-        let week_tl = Timeline::build(&[], now(), Scale::Week, width);
-        let month_tl = Timeline::build(&[], now(), Scale::Month, width);
+    fn zooming_out_covers_more_calendar() {
+        let day_tl = Timeline::build(&[], now(), Scale::Day, 40);
+        let week_tl = Timeline::build(&[], now(), Scale::Week, 40);
+        let month_tl = Timeline::build(&[], now(), Scale::Month, 40);
 
-        // The column count follows the available width; what changes is how much
-        // calendar each of those columns stands for.
+        // Each scale trades column count for reach, so the horizon strictly
+        // grows as you zoom out even though the window no longer depends on
+        // the terminal width.
         let days = |tl: &Timeline| (tl.to - tl.from).num_days();
         assert!(
-            days(&week_tl) > days(&day_tl) * 2,
-            "a week column must span more than a day: {} vs {}",
+            days(&week_tl) > days(&day_tl),
+            "a week window must reach further than a day window: {} vs {}",
             days(&week_tl),
             days(&day_tl)
         );
         assert!(
-            days(&month_tl) > days(&week_tl) * 2,
-            "a month column must span more than a week"
+            days(&month_tl) > days(&week_tl),
+            "a month window must reach further than a week window: {} vs {}",
+            days(&month_tl),
+            days(&week_tl)
         );
     }
 
@@ -983,14 +1076,136 @@ mod tests {
             }],
             now(),
             Scale::Day,
-            1,
+            40,
         );
         let _ = row_cells(&tl.rows[0], &tl);
     }
 
     #[test]
     fn a_zero_width_chart_does_not_panic() {
-        let tl = Timeline::build(&[], now(), Scale::Day, 0);
+        let tl = Timeline::build(&[], now(), Scale::Day, 40);
         assert!(tl.columns >= 1);
+    }
+
+    #[test]
+    fn month_columns_are_real_calendar_months() {
+        // A fixed 30-day month bucket drifts: from 2026-10-01 the columns run
+        // Oct 1, Oct 31, Nov 30, Dec 30, so two of them are labelled `Oct` and
+        // the one labelled `Oct` is really November.
+        let tl = Timeline::build(&[], now(), Scale::Month, 40);
+        for (i, date) in tl.dates.iter().enumerate() {
+            assert_eq!(date.day(), 1, "column {i} must start on the 1st");
+        }
+        let labels: Vec<_> = tl
+            .dates
+            .iter()
+            .map(|d| d.format("%Y-%m").to_string())
+            .collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            labels.len(),
+            sorted.len(),
+            "duplicate month columns: {labels:?}"
+        );
+        for pair in labels.windows(2) {
+            let a: Vec<i32> = pair[0]
+                .split('-')
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let b: Vec<i32> = pair[1]
+                .split('-')
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                (b[0] - a[0]) * 12 + (b[1] - a[1]),
+                1,
+                "gap between {pair:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_of_tracks_real_months() {
+        // Every date must land in the column whose month actually contains it.
+        let tl = Timeline::build(&[], now(), Scale::Month, 40);
+        for (i, start) in tl.dates.iter().enumerate() {
+            for day in 0..28 {
+                let probe = *start + Duration::days(day);
+                assert_eq!(tl.column_of(probe), Some(i), "{probe} vs column {i}");
+            }
+        }
+        // The last day of the month belongs to the same column as its 1st.
+        for (i, start) in tl.dates.iter().enumerate() {
+            let last = start.with_day(31).unwrap_or(*start);
+            let last = if last < *start { *start } else { last };
+            assert_eq!(tl.column_of(last), Some(i), "{last} vs column {i}");
+        }
+    }
+
+    #[test]
+    fn day_columns_are_consecutive_calendar_days() {
+        let tl = Timeline::build(&[], now(), Scale::Day, 40);
+        for w in tl.dates.windows(2) {
+            assert_eq!((w[1] - w[0]).num_days(), 1, "{w:?}");
+        }
+        for (i, date) in tl.dates.iter().enumerate() {
+            assert_eq!(tl.column_of(*date), Some(i));
+        }
+    }
+
+    #[test]
+    fn the_window_reaches_the_runway_for_every_scale() {
+        for scale in Scale::ALL {
+            let tl = Timeline::build(&[], now(), scale, 40);
+            let today = Timeline::local(now());
+            let horizon = scale.step(today, scale.runway_buckets());
+            assert!(
+                tl.to >= horizon,
+                "{scale:?} ends {} before the {}-bucket horizon {horizon}",
+                tl.to,
+                scale.runway_buckets()
+            );
+            // ...and today is on the chart, not off the left edge.
+            assert!(tl.now_col > 0 || tl.from <= today);
+        }
+    }
+
+    #[test]
+    fn the_day_scale_shows_the_next_thirty_days() {
+        let tl = Timeline::build(&[], now(), Scale::Day, 40);
+        let today = Timeline::local(now());
+        // Thirty days of runway past today, plus a little history so bars that
+        // started before today are still anchored to their creation date.
+        assert!(tl.to >= today + Duration::days(30), "to={}", tl.to);
+        assert!(
+            (tl.to - today).num_days() <= 30 + tl.scale.context_buckets() + 1,
+            "day scale runs to {}, far past the 30-day horizon",
+            tl.to
+        );
+        // A month of days must not spill into a third one.
+        let (year, month) = (today.year(), today.month());
+        let two_months_out = today + Duration::days(61);
+        assert!(two_months_out.year() != year || two_months_out.month() != month + 1);
+        assert!(
+            tl.dates
+                .iter()
+                .all(|d| d.year() == year || (d.year(), d.month()) >= (year, month))
+        );
+    }
+
+    #[test]
+    fn narrowing_keeps_the_window_and_dates_consistent() {
+        let wide = Timeline::build(&[], now(), Scale::Day, 40);
+        let narrow = wide.narrow(20);
+        assert_eq!(narrow.columns, 20);
+        assert_eq!(narrow.dates.len(), 20);
+        assert_eq!(narrow.header.len(), 20);
+        assert_eq!(narrow.from, wide.from);
+        // `to` must still be the real date of the last column boundary.
+        assert_eq!(narrow.to, Scale::Day.step(narrow.from, 20));
     }
 }

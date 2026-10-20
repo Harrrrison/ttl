@@ -117,10 +117,11 @@ pub fn draw(
             ui::detail::render(frame, main, &task, &subtasks, &app.detail, now);
         }
     } else if app.in_timeline() {
-        // The chart must be laid out before it is drawn, and that needs the
-        // column count, which depends on the title and gutter widths.
+        // Lay the chart out before drawing it: how many columns fit depends on
+        // the title and gutter widths, and a column is not one character.
         let title = main.width.saturating_sub(12).min(26);
-        let columns = usize::from(main.width.saturating_sub(title).saturating_sub(12));
+        let budget = main.width.saturating_sub(title).saturating_sub(12);
+        let columns = usize::from(budget) / app.scale.column_width();
         let tl = app.timeline(columns);
         ui::timeline::render(frame, main, &tl, app.cursor, app.timeline_scroll);
     } else {

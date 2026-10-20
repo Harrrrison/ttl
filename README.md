@@ -2,6 +2,9 @@
 
 A terminal task manager with a Gantt timeline and an agent-friendly JSON store.
 
+> **Docs:** [README](README.md) for people · [AGENTS.md](AGENTS.md) for reading
+> and driving the store · [IMPORT.md](IMPORT.md) for creating tasks from JSON
+
 `ttm` gives you a fast, Vim-style TUI for planning work against a calendar, and a
 fully-scriptable CLI over the exact same data. There is no daemon, no database
 server, and no background process: everything lives in three plain files you can
@@ -27,6 +30,7 @@ read, diff, and commit.
   - [Keybindings](#keybindings)
   - [The timeline](#the-timeline)
   - [The CLI](#the-cli)
+  - [Creating tasks from JSON](#creating-tasks-from-json)
   - [Scripting and automation](#scripting-and-automation)
 - [Data model](#data-model)
 - [How storage works](#how-storage-works)
@@ -193,7 +197,8 @@ The timeline keys (`T`, `+`, `-`) are also reachable from the CLI via
 Press `T` to toggle the Gantt view. Each row is a task; each column is a unit of
 calendar time at the current scale. Use `+` and `-` to zoom between scales:
 
-- **days** — one column per day, with weekend columns shaded.
+- **days** — one column per day, with weekend columns shaded. Every day of the
+  month is numbered, so the axis reads `28 29 30 31  1 2 3` across a boundary.
 - **weeks** — one column per week.
 - **months** — one column per month.
 
@@ -212,8 +217,15 @@ The right-hand gutter shows a live countdown (`OVER2d`, `D+3`) and the rolled-up
 estimate for each row. The timeline shares its cursor with the list, so `j`/`k`
 move through tasks in both, and `Enter` opens the detail for whatever is selected.
 
-The axis adapts to the terminal width: at narrow widths the legend drops entries
-rather than wrapping, and the chart keeps whatever runway fits.
+Each scale shows a different planning horizon, and the chart stretches to fill
+whatever width the terminal has: about 30 days at day scale, a few months at week
+scale, and a couple of years at month scale. On a narrow terminal the window is
+clipped to what fits, and the legend drops entries rather than wrapping.
+
+Each column is three characters wide. That is what lets the day axis print every
+day of the month — at one character per column the numbers ten to thirty-one did
+not fit at all, which is why the axis used to stop at nine, and at two they ran
+together as `9101112`.
 
 ### The CLI
 
@@ -227,6 +239,7 @@ The subcommands are:
 | `summary` | Aggregate counts and totals across the store |
 | `timeline` | Tasks laid out against the calendar |
 | `add` | Create a task |
+| `import` | Create one or more tasks from a JSON document, atomically |
 | `edit` (`set`) | Change fields on an existing task |
 | `done` | Mark a task done |
 | `start` | Mark a task in progress |
@@ -237,6 +250,50 @@ The subcommands are:
 
 **Global flags** — `-H/--home <DIR>` (store location), `-j/--json` (JSON output),
 `--text` (force plain text even when stdout is not a terminal).
+
+#### Creating tasks from JSON
+
+`ttm add` takes flags, which is right for a person and wrong for a caller
+holding structured data. When you are *generating* tasks — from a script, an
+agent, a migration — use `ttm import` instead:
+
+```sh
+# A file, stdin, or inline JSON.
+ttm import plan.json
+ttm import -            < plan.json
+ttm import '{"title":"Quick one","due":"+2d","estimate":"2h"}'
+
+# Preview first; write nothing.
+ttm import plan.json --dry-run -j
+
+# Safe to run twice.
+ttm import plan.json --skip-existing
+```
+
+A document may be a single task or `{"tasks": [...]}`, and a task may nest
+`subtasks` one level deep:
+
+```json
+{
+  "tasks": [{
+    "title": "Ship the 2.0 release",
+    "due": "+14d", "estimate": "3d", "priority": "high",
+    "tags": ["release"],
+    "attachments": [{ "target": "https://example.com/changelog" }],
+    "subtasks": [
+      { "title": "Freeze the branch", "due": "+7d", "estimate": "1h" },
+      { "title": "Write release notes", "due": "+10d", "estimate": "4h" }
+    ]
+  }]
+}
+```
+
+The whole document is validated before the store is touched, so a bad date in
+task five means **nothing** is written — never a half-applied batch. Errors name
+the offending path (`tasks[1].due`).
+
+Full guidelines, including field-by-field reference, error paths and recipes:
+**[IMPORT.md](IMPORT.md)**.
 
 #### Creating and editing
 
@@ -288,7 +345,7 @@ ttm list --limit 10
 
 ```sh
 ttm show "Ship release"             # full record
-ttm show 01a1 --rollup              # include subtask rollups (id prefix works)
+ttm show "Ship release" --rollup    # include subtask rollups
 ttm show "Ship release" --history   # include the event log
 ttm summary                        # counts + estimate totals
 ttm info --paths                    # where the store lives, as JSON
@@ -311,12 +368,16 @@ ttm info --paths -j | jq .tasks_path
 reach the rows with `.tasks[]` rather than iterating the top level.
 
 **Stable ids, cheap lookups.** `--ids` prints one id per line, and any command
-that takes a task accepts an id prefix or an exact title:
+that takes a task accepts a reference — an id prefix of at least 12 hex
+characters, or an exact title:
 
 ```sh
 id=$(ttm list -q "migration" --ids | head -1)
 ttm show "$id" -j
 ```
+
+Ids are UUIDv7, so tasks created in the same millisecond share a prefix and may
+need more characters to separate; pass the full id if a prefix is ambiguous.
 
 **Dry runs.** `add`, `edit`, `done`, `start`, `remove`, `link`, and `undo` all
 accept `--dry-run`: they validate and print the result without writing to disk.
@@ -430,6 +491,9 @@ deterministic, so changes to the layout show up as readable diffs.
 
 ### Layout
 
+Related docs: [`AGENTS.md`](AGENTS.md) (reading and driving the store) and
+[`IMPORT.md`](IMPORT.md) (creating tasks from JSON).
+
 ```
 src/
 ├── main.rs       # entry point; maps failures onto exit codes
@@ -441,6 +505,7 @@ src/
 ├── tui.rs        # terminal setup and the event loop
 ├── input.rs      # key parsing and the binding table
 ├── form.rs       # add/edit forms
+├── import.rs     # JSON bulk task creation
 ├── editor.rs     # text editing within the TUI
 └── ui/           # rendering: list, detail, timeline, help, statusbar
 tests/            # CLI and golden render tests
